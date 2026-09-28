@@ -1,8 +1,10 @@
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
-const DEFAULT_MODEL = 'llama-3.3-70b-versatile';
+const DEFAULT_MODEL = 'openai/gpt-oss-120b';
 
 async function callGroq(apiKey: string, prompt: string): Promise<any> {
   const model = process.env.GROQ_MODEL?.trim() || DEFAULT_MODEL;
+  const isGptOss = model.startsWith('openai/gpt-oss');
+  const reasoningEffort = process.env.GROQ_REASONING_EFFORT?.trim() || 'medium'; // low | medium | high
 
   const res = await fetch(GROQ_URL, {
     method: 'POST',
@@ -21,14 +23,19 @@ async function callGroq(apiKey: string, prompt: string): Promise<any> {
         { role: 'user', content: prompt },
       ],
       response_format: { type: 'json_object' },
-      temperature: 0.6,
-      max_tokens: 6000,
+      temperature: 1,
+      top_p: 1,
+      // gpt-oss'da "reasoning" tokenlari ham shu limitga kiradi, shuning uchun katta qiymat
+      max_completion_tokens: 8192,
+      ...(isGptOss ? { reasoning_effort: reasoningEffort } : {}),
     }),
   });
 
   if (!res.ok) {
     const errText = await res.text().catch(() => '');
-    throw new Error(`Groq API xatosi (${res.status}): ${errText.slice(0, 500)}`);
+    const err: any = new Error(`Groq API xatosi (${res.status}): ${errText.slice(0, 500)}`);
+    err.groqStatus = res.status;
+    throw err;
   }
 
   const data: any = await res.json();
@@ -255,16 +262,27 @@ export default async (req: Request) => {
       },
     });
   } catch (error: any) {
-    const errorMessage = error?.message || 'AI bilan bog‘lanishda xatolik yuz berdi. Iltimos, qayta urinib ko‘ring.';
-    const isApiKeyError = errorMessage.includes('GROQ_API_KEY');
+    console.error('AI xatosi:', error?.message || error);
+
+    const msg: string = error?.message || '';
+    const status: number | undefined = error?.groqStatus;
+    const isApiKeyError = msg.includes('GROQ_API_KEY');
+
+    let userMessage = 'AI bilan bog‘lanishda xatolik yuz berdi. Iltimos, qayta urinib ko‘ring.';
+    if (isApiKeyError) {
+      userMessage = 'AI xizmati sozlanmagan. Administrator Netlify Environment Variables orqali GROQ_API_KEY ni sozlashi kerak.';
+    } else if (status === 401) {
+      userMessage = 'Groq API kaliti noto‘g‘ri yoki bekor qilingan (401). Kalitni tekshirib, Netlify’da yangilang.';
+    } else if (status === 429 || status === 413) {
+      userMessage = 'Groq limiti oshib ketdi (' + status + '). Bir daqiqa kutib qayta urinib ko‘ring.';
+    } else if (status === 400 || status === 404) {
+      userMessage = 'Groq modeli topilmadi yoki so‘rov noto‘g‘ri (' + status + '). GROQ_MODEL ni tekshiring.';
+    } else if (error instanceof SyntaxError) {
+      userMessage = 'AI javobi noto‘g‘ri formatda keldi. Qayta urinib ko‘ring.';
+    }
 
     return new Response(
-      JSON.stringify({
-        error: isApiKeyError
-          ? 'AI xizmati sozlanmagan. Administrator Netlify Environment Variables orqali GROQ_API_KEY ni sozlashi kerak.'
-          : 'AI bilan bog‘lanishda xatolik yuz berdi. Iltimos, qayta urinib ko‘ring.',
-        details: process.env.NODE_ENV === 'development' ? error?.message : undefined,
-      }),
+      JSON.stringify({ error: userMessage, details: msg.slice(0, 600) }),
       {
         status: isApiKeyError ? 503 : 500,
         headers: {
